@@ -80,6 +80,27 @@ except:
   wp = None
 enable_timer = 0
 
+
+def cluster_poses(angle_diff, dist_diff, poses_in, symmetry_tfs):
+  """NumPy equivalent of mycpp.cluster_poses: greedy clustering of 4x4 poses; a pose starts a new cluster unless
+  some existing cluster within dist_diff (translation) is within angle_diff degrees (rotation geodesic distance)
+  of the pose under one of the symmetry transforms."""
+  poses_in = np.asarray(poses_in, dtype=np.float32)
+  symmetry_tfs = np.asarray(symmetry_tfs, dtype=np.float32)
+  cos_thres = np.cos(np.deg2rad(angle_diff))
+  out = [poses_in[0]]
+  for pose in poses_in[1:]:
+    cand = (pose[None] @ symmetry_tfs)[:, :3, :3]
+    clusters = np.asarray(out)
+    near = np.linalg.norm(clusters[:, :3, 3] - pose[:3, 3], axis=1) < dist_diff
+    # trace(R_cand @ R_cluster^T) for every (cluster, symmetry) pair
+    tr = np.einsum('sij,cij->cs', cand, clusters[:, :3, :3])
+    cos = np.clip((tr - 1) / 2, -1, 1)
+    if not (near[:, None] & (cos > cos_thres)).any():
+      out.append(pose)
+  return out
+
+
 def NestDict():
   return defaultdict(NestDict)
 
