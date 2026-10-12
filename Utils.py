@@ -67,6 +67,8 @@ try:
   if os.path.isdir(_mycpp_build):
     sys.path.insert(0, _mycpp_build)
   import mycpp
+  if not hasattr(mycpp, 'cluster_poses'):  # the unbuilt mycpp/ source directory imports as a namespace package
+    mycpp = None
 except Exception:
   mycpp = None
 try:
