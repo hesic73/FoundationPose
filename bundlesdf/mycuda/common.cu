@@ -14,16 +14,20 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <bits/stdc++.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <torch/torch.h>
 #include <stdint.h>
 #include <cstdio>
 #include <stdint.h>
 #include <stdexcept>
 #include <limits>
 #include <set>
-#include "common.h"
+#include "common_cuda.h"
 #include "Eigen/Dense"
+
+// Torch-free: the torch::Tensor wrappers are in common_torch.cpp (GCC 15 + nvcc cannot parse PyTorch headers).
+static inline int divCeil(int a, int b)
+{
+  return (a+b-1)/b;
+};
 
 
 
@@ -39,18 +43,18 @@
  * @return __global__
  */
 template <typename scalar_t>
-__global__ void sample_rays_uniform_occupied_voxels_kernel(const torch::PackedTensorAccessor32<scalar_t,2,torch::RestrictPtrTraits> z_sampled, const torch::PackedTensorAccessor32<scalar_t,3,torch::RestrictPtrTraits> z_in_out, torch::PackedTensorAccessor32<scalar_t,2,torch::RestrictPtrTraits> z_vals)
+__global__ void sample_rays_uniform_occupied_voxels_kernel(const scalar_t *z_sampled, const scalar_t *z_in_out, scalar_t *z_vals, const int N_rays, const int N_samples, const int max_n_box)
 {
   const int i_ray = blockIdx.x * blockDim.x + threadIdx.x;
   const int i_sample = blockIdx.y * blockDim.y + threadIdx.y;
-  if (i_ray>=z_sampled.size(0)) return;
-  if (i_sample>=z_sampled.size(1)) return;
+  if (i_ray>=N_rays) return;
+  if (i_sample>=N_samples) return;
 
   int i_box = 0;
-  float z_remain = z_sampled[i_ray][i_sample];
-  auto z_in_out_cur_ray = z_in_out[i_ray];
+  float z_remain = z_sampled[i_ray*N_samples+i_sample];
+  const scalar_t (*z_in_out_cur_ray)[2] = reinterpret_cast<const scalar_t (*)[2]>(z_in_out + i_ray*max_n_box*2);
+  scalar_t *z_val = z_vals + i_ray*N_samples + i_sample;
   const float eps = 1e-4;
-  const int max_n_box = z_in_out.size(1);
 
   if (z_in_out_cur_ray[0][0]==0) return;
 
@@ -60,12 +64,12 @@ __global__ void sample_rays_uniform_occupied_voxels_kernel(const torch::PackedTe
     {
       if (z_remain<=eps)
       {
-        z_vals[i_ray][i_sample] = z_in_out_cur_ray[max_n_box-1][1];
+        *z_val = z_in_out_cur_ray[max_n_box-1][1];
       }
       else
       {
         printf("ERROR sample_rays_uniform_occupied_voxels_kernel: z_remain=%f, i_ray=%d, i_sample=%d, i_box=%d, z_in_out_cur_ray=(%f,%f)\n",z_remain,i_ray,i_sample,i_box,z_in_out_cur_ray[i_box][0],z_in_out_cur_ray[i_box][1]);
-        for (int i=0;i<z_in_out.size(1);i++)
+        for (int i=0;i<max_n_box;i++)
         {
           printf("z_in_out_cur_ray[%d]=(%f,%f)\n",i,z_in_out_cur_ray[i][0],z_in_out_cur_ray[i][1]);
         }
@@ -80,13 +84,13 @@ __global__ void sample_rays_uniform_occupied_voxels_kernel(const torch::PackedTe
     {
       if (z_remain<=eps && i_box>=1)
       {
-        z_vals[i_ray][i_sample] = z_in_out_cur_ray[i_box-1][1];
+        *z_val = z_in_out_cur_ray[i_box-1][1];
         return;
       }
       else
       {
         printf("ERROR sample_rays_uniform_occupied_voxels_kernel: z_remain=%f, i_ray=%d, i_sample=%d, i_box=%d, z_in_out_cur_ray=(%f,%f)\n",z_remain,i_ray,i_sample,i_box,z_in_out_cur_ray[i_box][0],z_in_out_cur_ray[i_box][1]);
-        for (int i=0;i<z_in_out.size(1);i++)
+        for (int i=0;i<max_n_box;i++)
         {
           printf("z_in_out_cur_ray[%d]=(%f,%f)\n",i,z_in_out_cur_ray[i][0],z_in_out_cur_ray[i][1]);
         }
@@ -97,7 +101,7 @@ __global__ void sample_rays_uniform_occupied_voxels_kernel(const torch::PackedTe
     float box_len = z_in_out_cur_ray[i_box][1]-z_in_out_cur_ray[i_box][0];
     if (z_remain<=box_len)
     {
-      z_vals[i_ray][i_sample] = z_in_out_cur_ray[i_box][0] + z_remain;
+      *z_val = z_in_out_cur_ray[i_box][0] + z_remain;
       return;
     }
     z_remain -= box_len;
@@ -105,36 +109,29 @@ __global__ void sample_rays_uniform_occupied_voxels_kernel(const torch::PackedTe
   }
 }
 
-at::Tensor sampleRaysUniformOccupiedVoxels(const at::Tensor z_in_out,  const at::Tensor z_sampled, at::Tensor z_vals)
+template<class scalar_t>
+void launchSampleRaysUniformOccupiedVoxels(const scalar_t *z_sampled, const scalar_t *z_in_out, scalar_t *z_vals, int N_rays, int N_samples, int max_n_box, cudaStream_t stream)
 {
-  CHECK_INPUT(z_in_out);
-  CHECK_INPUT(z_sampled);
-  CHECK_INPUT(z_vals);
-  AT_ASSERTM(z_vals.sizes()==z_sampled.sizes());
-
-  const int N_rays = z_sampled.sizes()[0];
-  const int N_samples = z_sampled.sizes()[1];
   const int threadx = 32;
   const int thready = 32;
-
-  AT_DISPATCH_FLOATING_TYPES(z_in_out.type(), "sample_rays_uniform_occupied_voxels_kernel", ([&]
-  {
-    sample_rays_uniform_occupied_voxels_kernel<scalar_t><<<{divCeil(N_rays,threadx),divCeil(N_samples,thready)}, {threadx,thready}>>>(z_sampled.packed_accessor32<scalar_t,2,torch::RestrictPtrTraits>(),z_in_out.packed_accessor32<scalar_t,3,torch::RestrictPtrTraits>(),z_vals.packed_accessor32<scalar_t,2,torch::RestrictPtrTraits>());
-  }));
-
-  return z_vals;
+  dim3 blocks(divCeil(N_rays,threadx), divCeil(N_samples,thready));
+  dim3 threads(threadx, thready);
+  sample_rays_uniform_occupied_voxels_kernel<scalar_t><<<blocks, threads, 0, stream>>>(z_sampled, z_in_out, z_vals, N_rays, N_samples, max_n_box);
 }
+template void launchSampleRaysUniformOccupiedVoxels<float>(const float*, const float*, float*, int, int, int, cudaStream_t);
+template void launchSampleRaysUniformOccupiedVoxels<double>(const double*, const double*, double*, int, int, int, cudaStream_t);
 
 template<class scalar_t>
-__global__ void postprocessOctreeRayTracingKernel(const torch::PackedTensorAccessor32<long,1,torch::RestrictPtrTraits> ray_index, const torch::PackedTensorAccessor32<scalar_t,2,torch::RestrictPtrTraits> depth_in_out, const torch::PackedTensorAccessor32<long,1,torch::RestrictPtrTraits> unique_intersect_ray_ids, const torch::PackedTensorAccessor32<long,1,torch::RestrictPtrTraits> start_poss, torch::PackedTensorAccessor32<scalar_t,3,torch::RestrictPtrTraits> depths_in_out_padded)
+__global__ void postprocessOctreeRayTracingKernel(const int64_t *ray_index, const int N_hits, const scalar_t *depth_in_out_ptr, const int64_t *unique_intersect_ray_ids, const int64_t *start_poss, const int n_unique, scalar_t *depths_in_out_padded, const int max_intersections)
 {
   const int unique_id_pos = blockIdx.x * blockDim.x + threadIdx.x;
-  if (unique_id_pos>=unique_intersect_ray_ids.size(0)) return;
+  if (unique_id_pos>=n_unique) return;
   const int i_ray = unique_intersect_ray_ids[unique_id_pos];
 
   int i_intersect = 0;
-  auto cur_depths_in_out_padded = depths_in_out_padded[i_ray];
-  for (int i=start_poss[unique_id_pos];i<ray_index.size(0);i++)
+  const scalar_t (*depth_in_out)[2] = reinterpret_cast<const scalar_t (*)[2]>(depth_in_out_ptr);
+  scalar_t (*cur_depths_in_out_padded)[2] = reinterpret_cast<scalar_t (*)[2]>(depths_in_out_padded + (int64_t)i_ray*max_intersections*2);
+  for (int i=start_poss[unique_id_pos];i<N_hits;i++)
   {
     if (ray_index[i]!=i_ray) break;
     if (depth_in_out[i][0]==0 || depth_in_out[i][1]==0) break;
@@ -149,39 +146,15 @@ __global__ void postprocessOctreeRayTracingKernel(const torch::PackedTensorAcces
   }
 }
 
-at::Tensor postprocessOctreeRayTracing(const at::Tensor ray_index, const at::Tensor depth_in_out, const at::Tensor unique_intersect_ray_ids, const at::Tensor start_poss, const int max_intersections, const int N_rays)
+template<class scalar_t>
+void launchPostprocessOctreeRayTracing(const int64_t *ray_index, int N_hits, const scalar_t *depth_in_out, const int64_t *unique_intersect_ray_ids, const int64_t *start_poss, int n_unique, scalar_t *depths_in_out_padded, int max_intersections, cudaStream_t stream)
 {
-  CHECK_INPUT(ray_index);
-  CHECK_INPUT(depth_in_out);
-  CHECK_INPUT(start_poss);
-
-  const int n_unique_ids = unique_intersect_ray_ids.sizes()[0];
-  at::Tensor depths_in_out_padded = at::zeros({N_rays,max_intersections,2}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA, 0).requires_grad(false));
   dim3 threads = {256};
-  dim3 blocks = {divCeil(n_unique_ids,threads.x)};
-  AT_DISPATCH_FLOATING_TYPES(depth_in_out.type(), "postprocessOctreeRayTracingKernel", ([&]
-  {
-    postprocessOctreeRayTracingKernel<scalar_t><<<blocks,threads>>>(ray_index.packed_accessor32<long,1,torch::RestrictPtrTraits>(), depth_in_out.packed_accessor32<scalar_t,2,torch::RestrictPtrTraits>(), unique_intersect_ray_ids.packed_accessor32<long,1,torch::RestrictPtrTraits>(), start_poss.packed_accessor32<long,1,torch::RestrictPtrTraits>(), depths_in_out_padded.packed_accessor32<scalar_t,3,torch::RestrictPtrTraits>());
-  }));
-
-  return depths_in_out_padded;
+  dim3 blocks = {(unsigned)divCeil(n_unique,threads.x)};
+  postprocessOctreeRayTracingKernel<scalar_t><<<blocks,threads,0,stream>>>(ray_index, N_hits, depth_in_out, unique_intersect_ray_ids, start_poss, n_unique, depths_in_out_padded, max_intersections);
 }
-
-
-at::Tensor calculateBarycentricCoordinate3D(const at::Tensor &triangle, const at::Tensor &p)
-{
-  auto vector_A = triangle[1]-triangle[2];
-  auto vector_B = triangle[1]-triangle[0];
-  auto normal = vector_A.cross(vector_B);
-  auto areaABC = (normal * at::cross(triangle[1]-triangle[0], triangle[2]-triangle[0])).sum();
-  auto areaPBC = (normal * at::cross(triangle[1]-p, triangle[2]-p)).sum();
-  auto areaPCA = (normal * at::cross(triangle[2]-p, triangle[0]-p)).sum();
-  at::Tensor ws = at::zeros({3}).to(torch::kFloat32);
-  ws[0] = areaPBC / areaABC;
-  ws[1] = areaPCA / areaABC;
-  ws[2] = 1-ws[0]-ws[1];
-  return ws;
-}
+template void launchPostprocessOctreeRayTracing<float>(const int64_t*, int, const float*, const int64_t*, const int64_t*, int, float*, int, cudaStream_t);
+template void launchPostprocessOctreeRayTracing<double>(const int64_t*, int, const double*, const int64_t*, const int64_t*, int, double*, int, cudaStream_t);
 
 
 __device__ Eigen::Vector3f calculateBarycentricCoordinate3DKernel(const Eigen::Matrix<float,3,3> &triangle, const Eigen::Vector3f &p)
@@ -220,11 +193,16 @@ __device__ void calculateBarycentricCoordinate2DKernel(const Eigen::Matrix<float
 
 
 template<class scalar_t>
-__global__ void rayColorToTextureImageKernel(const torch::PackedTensorAccessor32<long,2,torch::RestrictPtrTraits> F, const torch::PackedTensorAccessor32<scalar_t,2,torch::RestrictPtrTraits> V, const torch::PackedTensorAccessor32<scalar_t,2,torch::RestrictPtrTraits> hit_locations, const torch::PackedTensorAccessor32<long,1,torch::RestrictPtrTraits> hit_face_ids, const torch::PackedTensorAccessor32<scalar_t,2,torch::RestrictPtrTraits> uvs_tex, torch::PackedTensorAccessor32<scalar_t,2,torch::RestrictPtrTraits> uvs)
+__global__ void rayColorToTextureImageKernel(const int64_t *F_ptr, const scalar_t *V_ptr, const scalar_t *hit_locations_ptr, const int64_t *hit_face_ids, const scalar_t *uvs_tex_ptr, scalar_t *uvs_ptr, const int N_hits)
 {
   const int i_hit = blockIdx.x*blockDim.x + threadIdx.x;
-  if (i_hit>=hit_locations.size(0)) return;
+  if (i_hit>=N_hits) return;
 
+  const int64_t (*F)[3] = reinterpret_cast<const int64_t (*)[3]>(F_ptr);
+  const scalar_t (*V)[3] = reinterpret_cast<const scalar_t (*)[3]>(V_ptr);
+  const scalar_t (*hit_locations)[3] = reinterpret_cast<const scalar_t (*)[3]>(hit_locations_ptr);
+  const scalar_t (*uvs_tex)[2] = reinterpret_cast<const scalar_t (*)[2]>(uvs_tex_ptr);
+  scalar_t (*uvs)[2] = reinterpret_cast<scalar_t (*)[2]>(uvs_ptr);
   auto face = F[hit_face_ids[i_hit]];
   Eigen::Matrix3f tri_v = Eigen::Matrix3f::Zero();
   for (int r=0;r<3;r++)
@@ -254,22 +232,15 @@ __global__ void rayColorToTextureImageKernel(const torch::PackedTensorAccessor32
 
 
 
-void rayColorToTextureImageCUDA(const at::Tensor &F, const at::Tensor &V, const at::Tensor &hit_locations, const at::Tensor &hit_face_ids, const at::Tensor &uvs_tex, at::Tensor &uvs)
+template<class scalar_t>
+void launchRayColorToTextureImage(const int64_t *F, const scalar_t *V, const scalar_t *hit_locations, const int64_t *hit_face_ids, const scalar_t *uvs_tex, scalar_t *uvs, int N_hits, cudaStream_t stream)
 {
-  CHECK_CONTIGUOUS(F);
-  CHECK_CONTIGUOUS(V);
-  CHECK_CONTIGUOUS(hit_locations);
-  CHECK_CONTIGUOUS(hit_face_ids);
-  CHECK_CONTIGUOUS(uvs_tex);
-
   dim3 threads = {512};
-  dim3 blocks = {divCeil(int(hit_locations.sizes()[0]),threads.x)};
-
-  AT_DISPATCH_FLOATING_TYPES(V.type(), "rayColorToTextureImageKernel", ([&]
-  {
-    rayColorToTextureImageKernel<scalar_t><<<blocks,threads>>>(F.packed_accessor32<long,2,torch::RestrictPtrTraits>(), V.packed_accessor32<scalar_t,2,torch::RestrictPtrTraits>(), hit_locations.packed_accessor32<scalar_t,2,torch::RestrictPtrTraits>(), hit_face_ids.packed_accessor32<long,1,torch::RestrictPtrTraits>(), uvs_tex.packed_accessor32<scalar_t,2,torch::RestrictPtrTraits>(), uvs.packed_accessor32<scalar_t,2,torch::RestrictPtrTraits>());
-  }));
+  dim3 blocks = {(unsigned)divCeil(N_hits,threads.x)};
+  rayColorToTextureImageKernel<scalar_t><<<blocks,threads,0,stream>>>(F, V, hit_locations, hit_face_ids, uvs_tex, uvs, N_hits);
 }
+template void launchRayColorToTextureImage<float>(const int64_t*, const float*, const float*, const int64_t*, const float*, float*, int, cudaStream_t);
+template void launchRayColorToTextureImage<double>(const int64_t*, const double*, const double*, const int64_t*, const double*, double*, int, cudaStream_t);
 
 
 

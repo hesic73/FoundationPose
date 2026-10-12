@@ -8,12 +8,33 @@
 
 
 import os, sys, time,torch,pickle,trimesh,itertools,pdb,zipfile,datetime,imageio,gzip,logging,joblib,importlib,uuid,signal,multiprocessing,psutil,subprocess,tarfile,scipy,argparse
-from pytorch3d.transforms import so3_log_map,so3_exp_map,se3_exp_map,se3_log_map,matrix_to_axis_angle,matrix_to_euler_angles,euler_angles_to_matrix, rotation_6d_to_matrix
-from pytorch3d.renderer import FoVPerspectiveCameras, PerspectiveCameras, look_at_view_transform, look_at_rotation, RasterizationSettings, MeshRenderer, MeshRasterizer, BlendParams, SoftSilhouetteShader, HardPhongShader, PointLights, TexturesVertex
-from pytorch3d.renderer.mesh.rasterize_meshes import barycentric_coordinates
-from pytorch3d.renderer.mesh.shader import SoftDepthShader, HardFlatShader
-from pytorch3d.renderer.mesh.textures import Textures
-from pytorch3d.structures import Meshes
+try:
+  from pytorch3d.transforms import so3_log_map,so3_exp_map,se3_exp_map,se3_log_map,matrix_to_axis_angle,matrix_to_euler_angles,euler_angles_to_matrix, rotation_6d_to_matrix
+  from pytorch3d.renderer import FoVPerspectiveCameras, PerspectiveCameras, look_at_view_transform, look_at_rotation, RasterizationSettings, MeshRenderer, MeshRasterizer, BlendParams, SoftSilhouetteShader, HardPhongShader, PointLights, TexturesVertex
+  from pytorch3d.renderer.mesh.rasterize_meshes import barycentric_coordinates
+  from pytorch3d.renderer.mesh.shader import SoftDepthShader, HardFlatShader
+  from pytorch3d.renderer.mesh.textures import Textures
+  from pytorch3d.structures import Meshes
+except ImportError:
+  # pytorch3d (CUDA build) is not needed for model-based inference: only these two transforms are used
+  # (learning/training/predict_pose_refine.py). Same math as pytorch3d.transforms.
+  def so3_exp_map(log_rot, eps=0.0001):
+    nrms = (log_rot*log_rot).sum(1)
+    rot_angles = torch.clamp(nrms, eps).sqrt()
+    rot_angles_inv = 1.0/rot_angles
+    fac1 = rot_angles_inv*rot_angles.sin()
+    fac2 = rot_angles_inv*rot_angles_inv*(1.0-rot_angles.cos())
+    x, y, z = log_rot.unbind(1)
+    zero = torch.zeros_like(x)
+    skews = torch.stack([zero,-z,y, z,zero,-x, -y,x,zero], dim=1).reshape(-1,3,3)
+    return fac1[:,None,None]*skews + fac2[:,None,None]*torch.bmm(skews,skews) + torch.eye(3, dtype=log_rot.dtype, device=log_rot.device)[None]
+
+  def rotation_6d_to_matrix(d6):
+    a1, a2 = d6[...,:3], d6[...,3:]
+    b1 = F.normalize(a1, dim=-1)
+    b2 = F.normalize(a2-(b1*a2).sum(-1, keepdim=True)*b1, dim=-1)
+    b3 = torch.cross(b1, b2, dim=-1)
+    return torch.stack((b1,b2,b3), dim=-2)
 from scipy.interpolate import griddata
 import nvdiffrast.torch as dr
 import torch.nn.functional as F

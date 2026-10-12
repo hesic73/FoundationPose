@@ -7,6 +7,9 @@
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
 
+import os, torch
+# Cap this process's CUDA caching allocator (the GPU also drives the desktop); override with FP_GPU_MEM_FRACTION.
+torch.cuda.set_per_process_memory_fraction(float(os.environ.get('FP_GPU_MEM_FRACTION', 0.7)))
 from estimater import *
 from datareader import *
 import argparse
@@ -69,8 +72,9 @@ if __name__=='__main__':
       center_pose = pose@np.linalg.inv(to_origin)
       vis = draw_posed_3d_box(reader.K, img=color, ob_in_cam=center_pose, bbox=bbox)
       vis = draw_xyz_axis(color, ob_in_cam=center_pose, scale=0.1, K=reader.K, thickness=3, transparency=0, is_input_rgb=True)
-      cv2.imshow('1', vis[...,::-1])
-      cv2.waitKey(1)
+      if not os.environ.get('FP_HEADLESS'):  # FP_HEADLESS=1: no window, just save track_vis (debug>=2)
+        cv2.imshow('1', vis[...,::-1])
+        cv2.waitKey(1)
 
 
     if debug>=2:

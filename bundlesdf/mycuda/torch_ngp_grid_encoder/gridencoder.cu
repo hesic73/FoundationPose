@@ -2,8 +2,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-#include <ATen/cuda/CUDAContext.h>
-#include <torch/torch.h>
+#include "gridencoder_cuda.h"
 
 #include <algorithm>
 #include <stdexcept>
@@ -12,18 +11,11 @@
 #include <cstdio>
 
 
-#define CHECK_CUDA(x) TORCH_CHECK(x.device().is_cuda(), #x " must be a CUDA tensor")
-#define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be a contiguous tensor")
-#define CHECK_IS_INT(x) TORCH_CHECK(x.scalar_type() == at::ScalarType::Int, #x " must be an int tensor")
-#define CHECK_IS_FLOATING(x) TORCH_CHECK(x.scalar_type() == at::ScalarType::Float || x.scalar_type() == at::ScalarType::Half || x.scalar_type() == at::ScalarType::Double, #x " must be a floating tensor")
-
-
-// just for compatability of half precision in AT_DISPATCH_FLOATING_TYPES_AND_HALF...
-static inline  __device__ at::Half atomicAdd(at::Half *address, at::Half val) {
-  // requires CUDA >= 10 and ARCH >= 70
-  // this is very slow compared to float or __half2, and never used.
-  //return atomicAdd(reinterpret_cast<__half*>(address), val);
-}
+// Torch-free: half precision is CUDA's __half here (bit-identical to at::Half); the torch::Tensor wrappers
+// are in gridencoder_torch.cpp (GCC 15 + nvcc cannot parse PyTorch headers).
+// acc(): float * at::Half used to promote to float; float * __half is ambiguous, so promote explicitly.
+template <typename T> static inline __device__ T acc(T x) { return x; }
+static inline __device__ float acc(__half x) { return __half2float(x); }
 
 
 template <typename T>
@@ -183,7 +175,7 @@ __global__ void kernel_grid(
         // writing to register (fast)
         #pragma unroll
         for (uint32_t ch = 0; ch < C; ch++) {
-            results[ch] += w * grid[index + ch];
+            results[ch] += w * acc(grid[index + ch]);
         }
 
         //printf("[b=%d, l=%d] int %d, idx %d, w %f, val %f\n", b, level, idx, index, w, grid[index]);
@@ -231,7 +223,7 @@ __global__ void kernel_grid(
 
                 #pragma unroll
                 for (uint32_t ch = 0; ch < C; ch++) {
-                    results_grad[ch] += w * (grid[index_right + ch] - grid[index_left + ch]);
+                    results_grad[ch] += w * acc(grid[index_right + ch] - grid[index_left + ch]);
                 }
             }
 
@@ -316,18 +308,18 @@ __global__ void kernel_grid_backward(
 
         // atomicAdd for __half is slow (especially for large values), so we use __half2 if N_C % 2 == 0
         // TODO: use float which is better than __half, if N_C % 2 != 0
-        if (std::is_same<scalar_t, at::Half>::value && N_C % 2 == 0) {
+        if (std::is_same<scalar_t, __half>::value && N_C % 2 == 0) {
             #pragma unroll
             for (uint32_t c = 0; c < N_C; c += 2) {
                 // process two __half at once (by interpreting as a __half2)
-                __half2 v = {(__half)(w * grad_cur[c]), (__half)(w * grad_cur[c + 1])};
+                __half2 v = {(__half)(w * acc(grad_cur[c])), (__half)(w * acc(grad_cur[c + 1]))};
                 atomicAdd((__half2*)&grad_grid[index + c], v);
             }
         // float, or __half when N_C % 2 != 0 (which means C == 1)
         } else {
             #pragma unroll
             for (uint32_t c = 0; c < N_C; c++) {
-                atomicAdd(&grad_grid[index + c], w * grad_cur[c]);
+                atomicAdd(&grad_grid[index + c], (scalar_t)(w * acc(grad_cur[c])));
             }
         }
     }
@@ -441,60 +433,9 @@ void grid_encode_backward_cuda(const scalar_t *grad, const float *inputs, const 
 }
 
 
-
-void grid_encode_forward(const at::Tensor inputs, const at::Tensor embeddings, const at::Tensor offsets, at::Tensor outputs, const uint32_t B, const uint32_t D, const uint32_t C, const uint32_t L, const float S, const uint32_t H, const bool calc_grad_inputs, at::Tensor dy_dx, const uint32_t gridtype, const bool align_corners) {
-    CHECK_CUDA(inputs);
-    CHECK_CUDA(embeddings);
-    CHECK_CUDA(offsets);
-    CHECK_CUDA(outputs);
-    CHECK_CUDA(dy_dx);
-
-    CHECK_CONTIGUOUS(inputs);
-    CHECK_CONTIGUOUS(embeddings);
-    CHECK_CONTIGUOUS(offsets);
-    CHECK_CONTIGUOUS(outputs);
-    CHECK_CONTIGUOUS(dy_dx);
-
-    CHECK_IS_FLOATING(inputs);
-    CHECK_IS_FLOATING(embeddings);
-    CHECK_IS_INT(offsets);
-    CHECK_IS_FLOATING(outputs);
-    CHECK_IS_FLOATING(dy_dx);
-
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
-    embeddings.scalar_type(), "grid_encode_forward", ([&] {
-        grid_encode_forward_cuda<scalar_t>(inputs.data_ptr<float>(), embeddings.data_ptr<scalar_t>(), offsets.data_ptr<int>(), outputs.data_ptr<scalar_t>(), B, D, C, L, S, H, calc_grad_inputs, dy_dx.data_ptr<scalar_t>(), gridtype, align_corners);
-    }));
-}
-
-void grid_encode_backward(const at::Tensor grad, const at::Tensor inputs, const at::Tensor embeddings, const at::Tensor offsets, at::Tensor grad_embeddings, const uint32_t B, const uint32_t D, const uint32_t C, const uint32_t L, const float S, const uint32_t H, const bool calc_grad_inputs, const at::Tensor dy_dx, at::Tensor grad_inputs, const uint32_t gridtype, const bool align_corners) {
-    CHECK_CUDA(grad);
-    CHECK_CUDA(inputs);
-    CHECK_CUDA(embeddings);
-    CHECK_CUDA(offsets);
-    CHECK_CUDA(grad_embeddings);
-    CHECK_CUDA(dy_dx);
-    CHECK_CUDA(grad_inputs);
-
-    CHECK_CONTIGUOUS(grad);
-    CHECK_CONTIGUOUS(inputs);
-    CHECK_CONTIGUOUS(embeddings);
-    CHECK_CONTIGUOUS(offsets);
-    CHECK_CONTIGUOUS(grad_embeddings);
-    CHECK_CONTIGUOUS(dy_dx);
-    CHECK_CONTIGUOUS(grad_inputs);
-
-    CHECK_IS_FLOATING(grad);
-    CHECK_IS_FLOATING(inputs);
-    CHECK_IS_FLOATING(embeddings);
-    CHECK_IS_INT(offsets);
-    CHECK_IS_FLOATING(grad_embeddings);
-    CHECK_IS_FLOATING(dy_dx);
-    CHECK_IS_FLOATING(grad_inputs);
-
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
-    grad.scalar_type(), "grid_encode_backward", ([&] {
-        grid_encode_backward_cuda<scalar_t>(grad.data_ptr<scalar_t>(), inputs.data_ptr<float>(), embeddings.data_ptr<scalar_t>(), offsets.data_ptr<int>(), grad_embeddings.data_ptr<scalar_t>(), B, D, C, L, S, H, calc_grad_inputs, dy_dx.data_ptr<scalar_t>(), grad_inputs.data_ptr<scalar_t>(), gridtype, align_corners);
-    }));
-
-}
+#define INSTANTIATE_GRID_ENCODE(scalar_t) \
+template void grid_encode_forward_cuda<scalar_t>(const float*, const scalar_t*, const int*, scalar_t*, const uint32_t, const uint32_t, const uint32_t, const uint32_t, const float, const uint32_t, const bool, scalar_t*, const uint32_t, const bool); \
+template void grid_encode_backward_cuda<scalar_t>(const scalar_t*, const float*, const scalar_t*, const int*, scalar_t*, const uint32_t, const uint32_t, const uint32_t, const uint32_t, const float, const uint32_t, const bool, scalar_t*, scalar_t*, const uint32_t, const bool);
+INSTANTIATE_GRID_ENCODE(float)
+INSTANTIATE_GRID_ENCODE(double)
+INSTANTIATE_GRID_ENCODE(__half)
